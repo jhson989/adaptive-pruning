@@ -1,20 +1,70 @@
 
-import os
+import argparse, os
+import random
+import secrets
 import torch
 from torchvision import datasets, transforms
 from torch import nn
 import torch.optim as optim
 import torch.nn.utils.prune as prune
 import torch.nn.functional as F
+import easydict
 
 
+#####################################################################################
+# Configuration
+#####################################################################################
+args = easydict.EasyDict({ 
+    "train" : True, 
+    
+    # Train policy
+    "numEpoch" : 30,
+    "batchSize" : 2048,
+    "lr" : 1e-4,
+    "manualSeed" : 1,
 
+    # Record
+    "retrain" : False, 
+    "savePath" : "./result/pruned/",
+    "loadPath" : "./result/unpruned/best.pth",
+    "logFreq" : 10,
+
+    # Hardware
+    "ngpu" : 1,
+    "numWorkers" : 5,    
+
+    # Genetic 
+    "numMember" : 5,
+    "numGeneration" : 5,
+
+})
+
+random.seed(args.manualSeed)
+torch.manual_seed(args.manualSeed)
+
+try:
+    if not os.path.exists(args.savePath):
+        os.makedirs(args.savePath)
+except OSError:
+    print("Error: Creating save folder. [" + args.savePath + "]")
+
+if torch.cuda.is_available() == False:
+    args.ngpu = 0
+
+if args.ngpu == 1:
+    args.device = torch.device("cuda")
+else :
+    args.device = torch.device("cpu")
+
+#####################################################################################
+# Logger
+#####################################################################################
 class Logger():
     def __init__(self, path, retrain):
         self.logFile = None
         if os.path.isfile(path+"log.txt") and retrain == True:
             self.logFile = open(path+"log.txt", "a")
-            self.logFile.write("\n\n [[[Retrain]]] \n")
+            self.log("\n\n----------------------[[[Retrain]]]----------------------\n")
         else :
             self.logFile = open(path+"log.txt", "w")
         
@@ -27,9 +77,15 @@ class Logger():
         self.logFile.flush()
 
 
-# Dataloader
+logger = Logger(args.savePath, args.retrain)
+logger.log(str(args))
 
-def getDataLoader(train, args, logger):
+
+
+#####################################################################################
+# Dataloader
+#####################################################################################
+def getDataLoader(train):
     # Define data
     mnistTransform = transforms.Compose([
         transforms.ToTensor(), 
@@ -37,7 +93,6 @@ def getDataLoader(train, args, logger):
     ])
 
     if train == True:
-
         trainDataset = datasets.MNIST(
             "./data/train",
             train=True,
@@ -68,17 +123,26 @@ def getDataLoader(train, args, logger):
             num_workers=args.numWorkers
         )
 
-"""# Model"""
+trainDataLoader = getDataLoader(True)
+testDataLoader = getDataLoader(False)
+crit = nn.CrossEntropyLoss().to(args.device)
 
+
+
+#####################################################################################
+# Model
+#####################################################################################
 class EvolvingSparseConnectedModel(nn.Module):
 
-    def __init__(self, overFactor=5):
+    def __init__(self, ID):
+        self.ID = ID
+        self.accuracy = 1000000.0
         super(EvolvingSparseConnectedModel, self).__init__()
-        self.fc1 = nn.Linear(28*28, 100)
-        self.fc2 = nn.Linear(100, 100)
-        self.fc3 = nn.Linear(100, 100)
-        self.fc4 = nn.Linear(100, 100)
-        self.fc5 = nn.Linear(100, 10)
+        self.fc1 = nn.Linear(28*28, 100, bias=False)
+        self.fc2 = nn.Linear(100, 100, bias=False)
+        self.fc3 = nn.Linear(100, 100, bias=False)
+        self.fc4 = nn.Linear(100, 100, bias=False)
+        self.fc5 = nn.Linear(100, 10, bias=False)
 
     def forward(self, x):
         x = x.view(-1, int(x.nelement() / x.shape[0]))
@@ -88,282 +152,108 @@ class EvolvingSparseConnectedModel(nn.Module):
         x = F.relu(self.fc4(x))
         return self.fc5(x)
 
-"""# PruningTrainer"""
+    def learn(self):
+        logger.log("\n\n------------ AI[%d] start ------------\n" % self.ID)
+        self.to(args.device)
+        optimizer = optim.Adam(self.parameters(), lr=args.lr)
 
+        #########################################################################
+        ### Pruning
+        for name, module in self.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                prune.l1_unstructured(module, name='weight', amount=0.95)
+                prune.remove(module, 'weight') # For logging
+                prune.l1_unstructured(module, name='weight', amount=0.95)
+        self.printSize()
 
-class PruningTranier:
+        for epoch in range(args.numEpoch):
 
-    def __init__(self, args, logger):
-
-        ### Arguments
-        self.args = args
-        self.logger = logger
-
-        ### Train Policy
-        # criterion
-        self.crit = nn.CrossEntropyLoss().to(self.args.device)
-        self.bestLoss = 2.0
-        self.bestPrunedLoss = 2.0
-
-        ### Pruning policy
-        self.recentLosses = [2.0]
-        self.pruned = False
-        self.startPrune = False
-
-
-    def train(self, model, dataLoader, evalDataLoader=None):
-
-        ### Data
-        self.dataLoader = dataLoader
-        self.evalDataLoader = evalDataLoader
-
-        ### Model
-        self.model = model
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.args.lr)
-
-        ### Re-training
-        startEpoch = 0
-        if self.args.retrain == True:
-            startEpoch = self.load(self.args.loadPath)
-
-        ### Training iteration
-        for epoch in range(startEpoch, self.args.numEpoch):
-
+            #########################################################################
             ### Train
             avgLoss = 0.0
-            self.model.train()
-            for idx, (img, gt) in enumerate(self.dataLoader):
-
+            self.train()
+            for idx, (img, gt) in enumerate(trainDataLoader):
                 ### learning
-                img, gt = img.to(self.args.device), gt.to(self.args.device)
-                self.optimizer.zero_grad()
-                pred = self.model(img)
-                loss = self.crit(pred, gt)
+                img, gt = img.to(args.device), gt.to(args.device)
+                optimizer.zero_grad()
+                pred = self.forward(img)
+                loss = crit(pred, gt)
                 loss.backward()
-                self.optimizer.step()
+                optimizer.step()
 
                 ### Logging
-                avgLoss = avgLoss + loss.item()
-                if idx % self.args.logFreq == 0 and idx != 0: 
-                    self.logger.log("[[%4d/%4d] [%4d/%4d]] loss CE(%.3f)"  % (epoch, self.args.numEpoch, idx, len(self.dataLoader), avgLoss/self.args.logFreq))
-                    avgLoss = 0.0
-
+                #avgLoss = avgLoss + loss.item()
+                #if idx % args.logFreq == 0 and idx != 0: 
+                #    logger.log(
+                #        "[%d] : [[%4d/%4d] [%4d/%4d]] loss CE(%.3f)" % 
+                #        (self.ID, epoch, args.numEpoch, idx, len(trainDataLoader), avgLoss/args.logFreq)
+                #    )
+                #    avgLoss = 0.0
+                    
+            #########################################################################
             ### Eval
-            if self.evalDataLoader is not None :
-                avgLoss = self.eval(self.evalDataLoader, epoch)
-            
-            ### Prune
-            self.adaptivePrune(epoch, avgLoss)
-
-
-
-    def eval(self, evalDataLoader, epoch):
-        
-        ### Eval
-        self.model.eval()
-        with torch.no_grad():
             avgLoss = 0.0
-            for idx, (img, gt) in enumerate(evalDataLoader):
+            self.eval()
+            with torch.no_grad():
+                for idx, (img, gt) in enumerate(testDataLoader):
+                    img, gt = img.to(args.device), gt.to(args.device)
+                    pred = self.forward(img)
+                    loss = crit(pred, gt)
+                    avgLoss = avgLoss + loss.item()
 
-                ### Forward
-                img, gt = img.to(self.args.device), gt.to(self.args.device)
-                pred = self.model(img)
-                loss = self.crit(pred, gt)
+                ### Logging
+                avgLoss = avgLoss/len(testDataLoader)
+                logger.log("%d : Eval loss(%.3f)" % (epoch, avgLoss))
+                self.accuracy = avgLoss if avgLoss < self.accuracy else self.accuracy
 
-                avgLoss = avgLoss + loss.item()
-
-            ### Logging
-            avgLoss = avgLoss/len(evalDataLoader)
-            self.logger.log("Eval loss : CE(%.3f)" % (avgLoss))
-
-            
-            if avgLoss < self.bestLoss :
-                self.logger.log("Best model at %d" % epoch)
-                self.bestLoss = avgLoss
-                self.save("best.pth", epoch)
-
-            if avgLoss < self.bestPrunedLoss and self.pruned == True :
-                self.logger.log("Best pruned model at %d" % epoch)
-                self.bestPrunedLoss = avgLoss
-                self.save("pruned_best.pth", epoch)
-
-            self.save("last.pth", epoch)
-
-            return avgLoss
-
-
-
-    def adaptivePrune(self, epoch, loss, searchLen = 10):
-
-        if self.args.prune == False:
-            return
-
-        self.recentLosses.append(loss)
-        self.recentLosses = self.recentLosses[1:] if len(self.recentLosses) > searchLen else self.recentLosses
-
-        self.remove()
-        printModelSize(self.model, logger)
-
-        if self.startPrune == False :
-            # Pruning
-            if sum( int(p<loss) for p in self.recentLosses ) >= (searchLen-2) :
-                self.recentLosses = [2.0]
-                amount = self.args.pruneAmount + self.args.amountDecay
-                self.args.pruneAmount =  amount if (0.1 <= amount and amount <= 0.99) else self.args.pruneAmount
-                self.startPrune = True
-            # Training
-            else :
-                return
-                
-        elif self.startPrune == True :
-            #Training
-            if sum( int(p<loss) for p in self.recentLosses ) >= (searchLen-2) :
-                self.recentLosses = [2.0]
-                self.startPrune = False
-                return
-
-
-        # Adaptive pruning
-        self.logger.log( "next : prune (%.1f) pct\n" % ((1-self.args.pruneAmount)*100) )
-        self.prune()
-        #self.args.amountDecay = self.args.amountDecay + 0.001 if self.args.amountDecay < self.args.maxDecay else self.args.amountDecay
-        #self.args.amountDecay = self.args.amountDecay - 0.001 if self.args.amountDecay > self.args.minDecay else self.args.amountDecay
-        
-
-
-    def prune(self):
-        
-        if self.args.prune == False:
-            return
-
-        if self.pruned == True :
-            self.remove()
-
-        self.pruned = True
-        for name, module in self.model.named_modules():
-            if isinstance(module, torch.nn.Conv2d) or isinstance(module, torch.nn.Linear):
-                prune.l1_unstructured(module, name='weight', amount=self.args.pruneAmount)
-                prune.l1_unstructured(module, name='bias', amount=self.args.pruneAmount)
-
-
-
-    def remove(self):
-
-        if self.args.prune == False:
-            return
-
-        if self.pruned == False:
-            return
-            
-        self.pruned = False
-        for name, module in self.model.named_modules():
-            if isinstance(module, torch.nn.Conv2d) or isinstance(module, torch.nn.Linear):
+        #########################################################################
+        ### Remove
+        for name, module in self.named_modules():
+            if isinstance(module, torch.nn.Linear):
                 prune.remove(module, 'weight')
-                prune.remove(module, 'bias')
+        self.cpu()
+
+    def evolve(self, parent1, parent2):
+        print("evolve : %d %d" % (parent1.ID, parent2.ID))
+
+    def printSize(self):
+        numParams = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        numNonzeros = sum(torch.count_nonzero(p) for p in self.parameters() if p.requires_grad)
+        logger.log("Pruned ratio : %d/%d = (%.3f/%.3f)GB =  %.3f %%" % 
+                (numNonzeros, numParams, float(numNonzeros)*8/pow(2,30), float(numParams)*8/pow(2,30), float(numNonzeros)/numParams*100)
+              )
 
 
 
-    def save(self, filename, numEpoch):
 
-        filename = self.args.savePath + filename
-        
-        self.remove()
-        self.model.eval()
-        torch.save({
-            "epoch" : numEpoch,
-            "modelStateDict" : self.model.state_dict(),
-            "optimizerStateDict" : self.optimizer.state_dict(),
-            "pruned" : self.pruned,
-            "pruneAmount" : self.args.pruneAmount,
-            "amountDecay" : self.args.amountDecay
-            }, filename)
+#####################################################################################
+# Model
+#####################################################################################
 
+for gen in range(args.numGeneration):
 
+    AIs = [EvolvingSparseConnectedModel(m) for m in range(args.numMember)]
 
-    def load(self, filename):
-
-        checkpoint = torch.load(filename)
-        self.model.load_state_dict(checkpoint["modelStateDict"])
-        printModelSize(self.model, logger)
-
-        self.optimizer.load_state_dict(checkpoint["optimizerStateDict"])
-        self.args.pruneAmount = checkpoint["pruneAmount"]
-        self.args.amountDecay = checkpoint["amountDecay"]
-
-        if checkpoint["pruned"]:
-            self.prune()
-
-        return checkpoint["epoch"]
-
-"""# main"""
-
-import argparse, os
-import random
-import torch
-
-#############################################################
-# Hyper-parameters
-#############################################################
-import easydict
-args = easydict.EasyDict({ 
-    "train" : True, 
+    #### Train
+    #for AI in AIs:
+    #    AI.learn()
     
-    # Train policy
-    "numEpoch" : 1000,
-    "batchSize" : 1024,
-    "lr" : 1e-4,
-    "manualSeed" : 1,
+    #### Sort
+    AIs.sort(key=lambda x: x.accuracy)
+    lottery = []
+    for idx, AI in enumerate(AIs):
+        for _ in range(idx, args.numMember):
+            lottery.append(AI.ID) 
+    logger.log(str(lottery))
 
-    # Prune
-    "prune" : True,
-    "pruneAmount" : 0.2,
-    "amountDecay" : 0.01,
-    "maxDecay" : 0.05,
-    "minDecay" : 0.01,
-    "overFactor" : 2,
+    #### Pick
+    AIs.sort(key=lambda x: x.ID)
+    children = [EvolvingSparseConnectedModel(m) for m in range(args.numMember)]
+    
+    for child in children:
+        parent1 = random.choice(lottery)
+        parent2 = random.choice(lottery)
+        child.evolve(AIs[parent1], AIs[parent2])
 
-    # Record
-    "savePath" : "./result/pruned/",
-    "retrain" : True, 
-    "loadPath" : "./result/unpruned/best.pth",
-    "logFreq" : 20,   
-
-    # Hardware
-    "ngpu" : 1,
-    "numWorkers" : 5,    
-})
-
-random.seed(args.manualSeed)
-torch.manual_seed(args.manualSeed)
-
-try:
-    if not os.path.exists(args.savePath):
-        os.makedirs(args.savePath)
-except OSError:
-    print("Error: Creating save folder. [" + args.savePath + "]")
-
-if torch.cuda.is_available() == False:
-    args.ngpu = 0
-
-if args.ngpu == 1:
-    args.device = torch.device("cuda")
-else :
-    args.device = torch.device("cpu")
-
-
-logger = Logger(args.savePath, args.retrain)
-logger.log(str(args))
-
-model = LeNet(args.overFactor).to(device=args.device)
-
-logger.log("[[[Train]]] Train started..")
-
-# Define data
-trainDataLoader = getDataLoader(True, args, logger)
-testDataLoader = getDataLoader(False, args, logger)
-
-# Define trainer
-trainer = PruningTranier(args=args, logger=logger)
-
-# Start training
-trainer.train(model, trainDataLoader, testDataLoader)
+    AIs = children
+    children = []
