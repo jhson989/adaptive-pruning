@@ -1,7 +1,13 @@
-import numpy as np
+
 import os
 import torch
-from PIL import Image
+from torchvision import datasets, transforms
+from torch import nn
+import torch.optim as optim
+import torch.nn.utils.prune as prune
+import torch.nn.functional as F
+
+
 
 class Logger():
     def __init__(self, path, retrain):
@@ -21,73 +27,7 @@ class Logger():
         self.logFile.flush()
 
 
-def weightsInit(m):
-    classname = m.__class__.__name__
-    if classname.find('Conv') != -1:
-        torch.nn.init.normal_(m.weight, 0.0, 0.02)
-    elif classname.find('BatchNorm') != -1:
-        torch.nn.init.normal_(m.weight, 1.0, 0.02)
-        torch.nn.init.zeros_(m.bias)
-
-
-def printModelSize(model, logger):
-    ## total number of parameters
-    numParams = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    numNonzeros = sum(torch.count_nonzero(p) for p in model.parameters() if p.requires_grad)
-    logger.log("Pruning ratio : %d/%d = (%.3f/%.3f)GB =  %.3f " % 
-                (numNonzeros, numParams, float(numNonzeros)*8/pow(2,30), float(numParams)*8/pow(2,30), float(numNonzeros)/numParams*100)
-              )
-
-    return float(numNonzeros)/numParams
-
-
-def listAllImg(dataPath):
-    filePaths = []
-    for root, dir, files in os.walk(dataPath):
-        for file in files:
-            if file.endswith(".jpg") or file.endswith(".png"):
-                filePath = os.path.join(root, file)
-                filePaths.append(filePath)
-            
-    return filePaths
-
-def saveImage(args, epoch, i, imgs, interval=150):
-    
-    if i % interval != 0:
-        return
-        
-    imgs = [img for img in imgs if img != None]
-
-    for idx in range(len(imgs)):
-        imgs[idx] = np.transpose(np.float32(imgs[idx].to("cpu").detach().numpy()[0])*255, (1,2,0))
-
-    img = combine(imgs)
-    img.save(args.savePath+"img_%d_%d.png"%(epoch,i))
-
-def combine(imgs):
-
-    for i in range(len(imgs)):
-        imgs[i] = Image.fromarray(np.uint8(imgs[i]))
-
-    widths, heights = zip(*(i.size for i in imgs))
-    totalWidth = sum(widths)
-    totalHeight = max(heights)
-
-    new_img = Image.new("RGB", (totalWidth, totalHeight))
-    offset = 0
-    for img in imgs:
-        new_img.paste(img, (offset, 0))
-        offset += img.size[0]
-
-    return new_img
-
-"""**굵은 텍스트**# 새 섹션
-
 # Dataloader
-"""
-
-import torch
-from torchvision import datasets, transforms
 
 def getDataLoader(train, args, logger):
     # Define data
@@ -130,38 +70,26 @@ def getDataLoader(train, args, logger):
 
 """# Model"""
 
-import torch
-from torch import nn
-import torch.nn.functional as F
+class EvolvingSparseConnectedModel(nn.Module):
 
-
-#### Over-parameterized LeNet to solve the mnist problem
-class LeNet(nn.Module):
     def __init__(self, overFactor=5):
-        super(LeNet, self).__init__()
-        # 1 input image channel, 6 output channels, 3x3 square conv kernel
-        self.conv1 = nn.Conv2d(1, overFactor*6, 3)
-        self.conv2 = nn.Conv2d(overFactor*6, overFactor*16, 3)
-        self.fc1 = nn.Linear(overFactor * 16 * 5 * 5, overFactor * 120)  # 5x5 image dimension
-        self.fc2 = nn.Linear(overFactor * 120, overFactor * 84)
-        self.fc3 = nn.Linear(overFactor * 84, 10)
+        super(EvolvingSparseConnectedModel, self).__init__()
+        self.fc1 = nn.Linear(28*28, 100)
+        self.fc2 = nn.Linear(100, 100)
+        self.fc3 = nn.Linear(100, 100)
+        self.fc4 = nn.Linear(100, 100)
+        self.fc5 = nn.Linear(100, 10)
 
     def forward(self, x):
-        x = F.max_pool2d(F.relu(self.conv1(x)), (2, 2))
-        x = F.max_pool2d(F.relu(self.conv2(x)), 2)
         x = x.view(-1, int(x.nelement() / x.shape[0]))
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
+        return self.fc5(x)
 
 """# PruningTrainer"""
 
-# Commented out IPython magic to ensure Python compatibility.
-import torch
-import torch.optim as optim
-import torch.nn.utils.prune as prune
-from torch import nn
 
 class PruningTranier:
 
