@@ -19,8 +19,8 @@ args = easydict.EasyDict({
     
     # Train policy
     "numEpoch" : 30,
-    "batchSize" : 2048,
-    "lr" : 1e-4,
+    "batchSize" : 1024*4,
+    "lr" : 1e-3,
     "manualSeed" : 1,
 
     # Record
@@ -34,8 +34,8 @@ args = easydict.EasyDict({
     "numWorkers" : 5,    
 
     # Genetic 
-    "numMember" : 5,
-    "numGeneration" : 5,
+    "numMember" : 20,
+    "numGeneration" : 10,
 
 })
 
@@ -159,18 +159,18 @@ class EvolvingSparseConnectedModel(nn.Module):
 
         #########################################################################
         ### Pruning
+        amount = float(90+(random.randrange(4,9)))/100.0
         for name, module in self.named_modules():
             if isinstance(module, torch.nn.Linear):
-                prune.l1_unstructured(module, name='weight', amount=0.95)
+                prune.l1_unstructured(module, name='weight', amount=amount)
                 prune.remove(module, 'weight') # For logging
-                prune.l1_unstructured(module, name='weight', amount=0.95)
+                prune.l1_unstructured(module, name='weight', amount=amount)
         self.printSize()
 
         for epoch in range(args.numEpoch):
 
             #########################################################################
             ### Train
-            avgLoss = 0.0
             self.train()
             for idx, (img, gt) in enumerate(trainDataLoader):
                 ### learning
@@ -192,19 +192,23 @@ class EvolvingSparseConnectedModel(nn.Module):
                     
             #########################################################################
             ### Eval
-            avgLoss = 0.0
+            total = 0.0
+            correct = 0
             self.eval()
             with torch.no_grad():
                 for idx, (img, gt) in enumerate(testDataLoader):
                     img, gt = img.to(args.device), gt.to(args.device)
                     pred = self.forward(img)
-                    loss = crit(pred, gt)
-                    avgLoss = avgLoss + loss.item()
+
+                    _, predIdx = torch.max(pred, 1)
+                    total += gt.size(0)
+                    correct += (predIdx == gt).sum().float()
+
 
                 ### Logging
-                avgLoss = avgLoss/len(testDataLoader)
-                logger.log("%d : Eval loss(%.3f)" % (epoch, avgLoss))
-                self.accuracy = avgLoss if avgLoss < self.accuracy else self.accuracy
+                accuracy = 100.0*correct/total
+                logger.log("Idx(%d) : eval(%.3f)%%" % (epoch, accuracy))
+                self.accuracy = accuracy if accuracy < self.accuracy else self.accuracy
 
         #########################################################################
         ### Remove
@@ -214,12 +218,16 @@ class EvolvingSparseConnectedModel(nn.Module):
         self.cpu()
 
     def evolve(self, parent1, parent2):
-        print("evolve : %d %d" % (parent1.ID, parent2.ID))
+        logger.log(" --- evolved : %d <- %d %d" % (self.ID, parent1.ID, parent2.ID))
+        for m, p1, p2 in zip(self.modules(), parent1.modules(), parent2.modules()):
+            if isinstance(m, torch.nn.Linear):
+                with torch.no_grad():
+                    m.weight.copy_((p1.weight + p2.weight)/2)
 
     def printSize(self):
         numParams = sum(p.numel() for p in self.parameters() if p.requires_grad)
         numNonzeros = sum(torch.count_nonzero(p) for p in self.parameters() if p.requires_grad)
-        logger.log("Pruned ratio : %d/%d = (%.3f/%.3f)GB =  %.3f %%" % 
+        logger.log(" --- pruned ratio : %d/%d = (%.3f/%.3f)GB =  %.3f %%" % 
                 (numNonzeros, numParams, float(numNonzeros)*8/pow(2,30), float(numParams)*8/pow(2,30), float(numNonzeros)/numParams*100)
               )
 
@@ -231,12 +239,14 @@ class EvolvingSparseConnectedModel(nn.Module):
 #####################################################################################
 
 for gen in range(args.numGeneration):
-
+    logger.log("\n\n==============================================")
+    logger.log("Generation %d start" % (gen))
+    logger.log("==============================================\n")
     AIs = [EvolvingSparseConnectedModel(m) for m in range(args.numMember)]
 
     #### Train
-    #for AI in AIs:
-    #    AI.learn()
+    for AI in AIs:
+        AI.learn()
     
     #### Sort
     AIs.sort(key=lambda x: x.accuracy)
