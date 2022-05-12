@@ -219,6 +219,7 @@ class EvolvingSparseConnectedModel(nn.Module):
 
 
 
+
     def evolve(self, parent1, parent2):
         logger.log(" -- evolved : %d <- %d %d" % (self.ID, parent1.ID, parent2.ID))
         for m, p1, p2 in zip(self.modules(), parent1.modules(), parent2.modules()):
@@ -230,7 +231,7 @@ class EvolvingSparseConnectedModel(nn.Module):
     def printSize(self):
         numParams = sum(p.numel() for p in self.parameters() if p.requires_grad)
         numNonzeros = sum(torch.count_nonzero(p) for p in self.parameters() if p.requires_grad)
-        logger.log("Pruned ratio : %d/%d = (%.3f/%.3f)GB =  %.3f %%" % 
+        logger.log(" -- pruned ratio : %d/%d = (%.3f/%.3f)GB =  %.3f %%" % 
                 (numNonzeros, numParams, float(numNonzeros)*8/pow(2,30), float(numParams)*8/pow(2,30), float(numNonzeros)/numParams*100)
               )
     
@@ -285,6 +286,7 @@ for gen in range(start, args.numGeneration):
         for _ in range(int((args.numMember-idx)**(1.5))):
             lottery.append(AI.ID) 
     logger.log(str(lottery))
+    
 
     #### Pick
     AIs.sort(key=lambda x: x.ID)
