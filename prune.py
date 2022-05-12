@@ -1,4 +1,3 @@
-
 import argparse, os
 import random
 import secrets
@@ -11,30 +10,37 @@ import torch.nn.functional as F
 import easydict
 
 
+
 #####################################################################################
 # Configuration
 #####################################################################################
+
+colab = False
+folder = "/content/drive/MyDrive/DNN/evolve/" if colab else "./"
+
 args = easydict.EasyDict({ 
     "train" : True, 
     
     # Train policy
-    "numEpoch" : 30,
-    "batchSize" : 2048,
-    "lr" : 1e-4,
+    "numEpoch" : 300,
+    "batchSize" : 1024*4,
+    "lr" : 1e-3,
     "manualSeed" : 1,
 
     # Record
     "retrain" : False, 
-    "savePath" : "./result/pruned/",
-    "loadPath" : "./result/unpruned/best.pth",
+    "savePath" : folder+"result/1/",
+    "loadPath" : folder+"result/1/last_6.pth",
+    
     "logFreq" : 10,
 
     # Hardware
     "ngpu" : 1,
-    "numWorkers" : 5,    
+    "numWorkers" : 3,    
 
     # Genetic 
-    "numMember" : 5,
+    "numMember" : 20,
+    "numChildren" : 20,
     "numGeneration" : 5,
 
 })
@@ -60,13 +66,13 @@ else :
 # Logger
 #####################################################################################
 class Logger():
-    def __init__(self, path, retrain):
+    def __init__(self, path, filename="log.txt", retrain=False):
         self.logFile = None
-        if os.path.isfile(path+"log.txt") and retrain == True:
-            self.logFile = open(path+"log.txt", "a")
+        if os.path.isfile(path+filename) and retrain == True:
+            self.logFile = open(path+filename, "a")
             self.log("\n\n----------------------[[[Retrain]]]----------------------\n")
         else :
-            self.logFile = open(path+"log.txt", "w")
+            self.logFile = open(path+filename, "w")
         
     def __del__(self):
         self.logFile.close()
@@ -76,8 +82,7 @@ class Logger():
         self.logFile.write(logStr+"\n")
         self.logFile.flush()
 
-
-logger = Logger(args.savePath, args.retrain)
+logger = Logger(args.savePath, "global_logger.txt", args.retrain)
 logger.log(str(args))
 
 
@@ -94,7 +99,7 @@ def getDataLoader(train):
 
     if train == True:
         trainDataset = datasets.MNIST(
-            "./data/train",
+            folder+"data/train",
             train=True,
             download=True,
             transform=mnistTransform
@@ -110,7 +115,7 @@ def getDataLoader(train):
 
     else :
         testDataset = datasets.MNIST(
-            "./data/eval",
+            folder+"data/eval",
             train=False,
             download=True,
             transform=mnistTransform
@@ -136,7 +141,7 @@ class EvolvingSparseConnectedModel(nn.Module):
 
     def __init__(self, ID):
         self.ID = ID
-        self.accuracy = 1000000.0
+        self.accuracy = 0.0
         super(EvolvingSparseConnectedModel, self).__init__()
         self.fc1 = nn.Linear(28*28, 100, bias=False)
         self.fc2 = nn.Linear(100, 100, bias=False)
@@ -152,25 +157,25 @@ class EvolvingSparseConnectedModel(nn.Module):
         x = F.relu(self.fc4(x))
         return self.fc5(x)
 
-    def learn(self):
-        logger.log("\n\n------------ AI[%d] start ------------\n" % self.ID)
+    def learn(self, gen):
+        logger.log("\n\n------------ AI[%d] start ------------" % self.ID)
         self.to(args.device)
         optimizer = optim.Adam(self.parameters(), lr=args.lr)
 
         #########################################################################
         ### Pruning
+        amount = float(980+(random.randrange(0,10)))/1000.0
         for name, module in self.named_modules():
             if isinstance(module, torch.nn.Linear):
-                prune.l1_unstructured(module, name='weight', amount=0.95)
+                prune.l1_unstructured(module, name='weight', amount=amount)
                 prune.remove(module, 'weight') # For logging
-                prune.l1_unstructured(module, name='weight', amount=0.95)
+                prune.l1_unstructured(module, name='weight', amount=amount)
         self.printSize()
 
         for epoch in range(args.numEpoch):
 
             #########################################################################
             ### Train
-            avgLoss = 0.0
             self.train()
             for idx, (img, gt) in enumerate(trainDataLoader):
                 ### learning
@@ -181,30 +186,28 @@ class EvolvingSparseConnectedModel(nn.Module):
                 loss.backward()
                 optimizer.step()
 
-                ### Logging
-                #avgLoss = avgLoss + loss.item()
-                #if idx % args.logFreq == 0 and idx != 0: 
-                #    logger.log(
-                #        "[%d] : [[%4d/%4d] [%4d/%4d]] loss CE(%.3f)" % 
-                #        (self.ID, epoch, args.numEpoch, idx, len(trainDataLoader), avgLoss/args.logFreq)
-                #    )
-                #    avgLoss = 0.0
-                    
+            if epoch % 5 != 0 and epoch != args.numEpoch-1:
+                continue
             #########################################################################
             ### Eval
-            avgLoss = 0.0
+            total = 0.0
+            correct = 0
             self.eval()
             with torch.no_grad():
                 for idx, (img, gt) in enumerate(testDataLoader):
                     img, gt = img.to(args.device), gt.to(args.device)
                     pred = self.forward(img)
-                    loss = crit(pred, gt)
-                    avgLoss = avgLoss + loss.item()
+                    _, predIdx = torch.max(pred, 1)
+                    total += gt.size(0)
+                    correct += (predIdx == gt).sum().float()
 
                 ### Logging
-                avgLoss = avgLoss/len(testDataLoader)
-                logger.log("%d : Eval loss(%.3f)" % (epoch, avgLoss))
-                self.accuracy = avgLoss if avgLoss < self.accuracy else self.accuracy
+                accuracy = 100.0*correct/total
+                logger.log("Idx(%d) : eval(%.3f)%%" % (epoch, accuracy))
+                self.accuracy = accuracy if accuracy > self.accuracy else self.accuracy
+
+            if epoch > 100 and self.accuracy < 30:
+                break
 
         #########################################################################
         ### Remove
@@ -212,9 +215,17 @@ class EvolvingSparseConnectedModel(nn.Module):
             if isinstance(module, torch.nn.Linear):
                 prune.remove(module, 'weight')
         self.cpu()
+        self.save(gen)
+
+
 
     def evolve(self, parent1, parent2):
-        print("evolve : %d %d" % (parent1.ID, parent2.ID))
+        logger.log(" -- evolved : %d <- %d %d" % (self.ID, parent1.ID, parent2.ID))
+        for m, p1, p2 in zip(self.modules(), parent1.modules(), parent2.modules()):
+            if isinstance(m, torch.nn.Linear):
+                with torch.no_grad():
+                    m.weight.copy_((p1.weight + p2.weight)/2)
+
 
     def printSize(self):
         numParams = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -222,38 +233,73 @@ class EvolvingSparseConnectedModel(nn.Module):
         logger.log("Pruned ratio : %d/%d = (%.3f/%.3f)GB =  %.3f %%" % 
                 (numNonzeros, numParams, float(numNonzeros)*8/pow(2,30), float(numParams)*8/pow(2,30), float(numNonzeros)/numParams*100)
               )
+    
 
+    def save(self, gen):
+        torch.save(
+            self.state_dict(),
+            args.savePath+"model_%d_%d.pth" % (gen, self.ID)
+        )
 
 
 
 #####################################################################################
 # Model
 #####################################################################################
+def load(models, args):
+    if args.retrain == False:
+        return 0
+    else :
+        return 0
 
-for gen in range(args.numGeneration):
 
-    AIs = [EvolvingSparseConnectedModel(m) for m in range(args.numMember)]
+
+def save(models, generation, name):
+    torch.save({
+            "gen" : generation,
+            "args" : args,
+            "AIs" : models
+            }, args.savePath+name)
+
+#####################################################################################
+# Model
+#####################################################################################
+AIs = [EvolvingSparseConnectedModel(m) for m in range(args.numMember)]
+start = load(AIs, args)
+bestAccuracy = 0.0
+
+for gen in range(start, args.numGeneration):
+    logger.log("\n\n==============================================")
+    logger.log("Generation %d start" % (gen))
+    logger.log(" -- member : %d" % (len(AIs)))
+    logger.log("==============================================\n")
 
     #### Train
-    #for AI in AIs:
-    #    AI.learn()
-    
+    for AI in AIs:
+        AI.learn(gen)
+
     #### Sort
-    AIs.sort(key=lambda x: x.accuracy)
+    AIs.sort(key=lambda x: x.accuracy, reverse=True)
     lottery = []
     for idx, AI in enumerate(AIs):
-        for _ in range(idx, args.numMember):
+        for _ in range(int((args.numMember-idx)**(1.5))):
             lottery.append(AI.ID) 
     logger.log(str(lottery))
 
     #### Pick
     AIs.sort(key=lambda x: x.ID)
-    children = [EvolvingSparseConnectedModel(m) for m in range(args.numMember)]
+    logger.log(str([float(a.accuracy) for a in AIs]))
+    children = [EvolvingSparseConnectedModel(m) for m in range(args.numChildren)]
     
     for child in children:
         parent1 = random.choice(lottery)
         parent2 = random.choice(lottery)
         child.evolve(AIs[parent1], AIs[parent2])
 
-    AIs = children
+    #### Next Generation
+    if args.numMember-args.numChildren > 0:
+        AIs.sort(key=lambda x: x.accuracy, reverse=True)
+        AIs = AIs[0:args.numMember-args.numChildren] + children
+        for ID, AI in enumerate(AIs):
+            AI.ID = ID
     children = []
