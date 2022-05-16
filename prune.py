@@ -22,26 +22,28 @@ args = easydict.EasyDict({
     "train" : True, 
     
     # Train policy
-    "numEpoch" : 300,
+    "numEpoch" : 600,
     "batchSize" : 1024*4,
     "lr" : 1e-3,
-    "manualSeed" : 1,
+    "manualSeed" : 3,
 
     # Record
     "retrain" : False, 
-    "savePath" : folder+"result/1/",
-    "loadPath" : folder+"result/1/last_6.pth",
+    "startGen" : 0,
+    "startID" : 0,
+    "savePath" : folder+"result/4/",
+    "loadPath" : folder+"result/3/last_0.pth",
     
     "logFreq" : 10,
 
     # Hardware
     "ngpu" : 1,
-    "numWorkers" : 3,    
+    "numWorkers" : 6,    
 
     # Genetic 
-    "numMember" : 20,
-    "numChildren" : 20,
-    "numGeneration" : 5,
+    "numMember" : 10,
+    "numChildren" : 10,
+    "numGeneration" : 3,
 
 })
 
@@ -164,7 +166,7 @@ class EvolvingSparseConnectedModel(nn.Module):
 
         #########################################################################
         ### Pruning
-        amount = float(980+(random.randrange(0,10)))/1000.0
+        amount = float(980+(random.randrange(-1,2)))/1000.0
         for name, module in self.named_modules():
             if isinstance(module, torch.nn.Linear):
                 prune.l1_unstructured(module, name='weight', amount=amount)
@@ -206,8 +208,6 @@ class EvolvingSparseConnectedModel(nn.Module):
                 logger.log("Idx(%d) : eval(%.3f)%%" % (epoch, accuracy))
                 self.accuracy = accuracy if accuracy > self.accuracy else self.accuracy
 
-            if epoch > 100 and self.accuracy < 30:
-                break
 
         #########################################################################
         ### Remove
@@ -215,7 +215,6 @@ class EvolvingSparseConnectedModel(nn.Module):
             if isinstance(module, torch.nn.Linear):
                 prune.remove(module, 'weight')
         self.cpu()
-        self.save(gen)
 
 
 
@@ -242,42 +241,35 @@ class EvolvingSparseConnectedModel(nn.Module):
             args.savePath+"model_%d_%d.pth" % (gen, self.ID)
         )
 
+    def load(self, gen):
+        self.load_state_dict(torch.load(args.savePath+"model_%d_%d.pth" % (gen, self.ID)))
+
 
 
 #####################################################################################
-# Model
+# Main
 #####################################################################################
-def load(models, args):
-    if args.retrain == False:
-        return 0
-    else :
-        return 0
 
-
-
-def save(models, generation, name):
-    torch.save({
-            "gen" : generation,
-            "args" : args,
-            "AIs" : models
-            }, args.savePath+name)
-
-#####################################################################################
-# Model
-#####################################################################################
 AIs = [EvolvingSparseConnectedModel(m) for m in range(args.numMember)]
-start = load(AIs, args)
-bestAccuracy = 0.0
-
-for gen in range(start, args.numGeneration):
+if args.retrain == True:
+    for AI in AIs:
+        AI.load(args.startGen)
+    
+for gen in range(args.startGen, args.numGeneration):
     logger.log("\n\n==============================================")
     logger.log("Generation %d start" % (gen))
     logger.log(" -- member : %d" % (len(AIs)))
     logger.log("==============================================\n")
 
-    #### Train
+    #### Pre-save
     for AI in AIs:
-        AI.learn(gen)
+        AI.save(gen)
+
+    #### Train
+    for i in range(args.startID, args.numMember):
+        AIs[i].learn(gen)
+        AIs[i].save(gen)
+
 
     #### Sort
     AIs.sort(key=lambda x: x.accuracy, reverse=True)
@@ -293,10 +285,13 @@ for gen in range(start, args.numGeneration):
     logger.log(str([float(a.accuracy) for a in AIs]))
     children = [EvolvingSparseConnectedModel(m) for m in range(args.numChildren)]
     
+
+    #### Make children
     for child in children:
         parent1 = random.choice(lottery)
         parent2 = random.choice(lottery)
         child.evolve(AIs[parent1], AIs[parent2])
+
 
     #### Next Generation
     if args.numMember-args.numChildren > 0:
@@ -305,3 +300,4 @@ for gen in range(start, args.numGeneration):
         for ID, AI in enumerate(AIs):
             AI.ID = ID
     children = []
+    args.startID = 0
