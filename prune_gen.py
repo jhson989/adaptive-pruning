@@ -29,9 +29,10 @@ args = easydict.EasyDict({
 
     # Record
     "retrain" : False, 
-    "startGen" : 0,
+    "startGen" : 3,
     "startID" : 0,
-    "savePath" : folder+"result/4/",
+    "savePath" : folder+"result/5/",
+    "loadPath" : folder+"result/4/",
     
     "logFreq" : 10,
 
@@ -42,7 +43,7 @@ args = easydict.EasyDict({
     # Genetic 
     "numMember" : 10,
     "numChildren" : 10,
-    "numGeneration" : 3,
+    "numGeneration" : 8,
 
 })
 
@@ -241,7 +242,7 @@ class EvolvingSparseConnectedModel(nn.Module):
         )
 
     def load(self, gen):
-        self.load_state_dict(torch.load(args.savePath+"model_%d_%d.pth" % (gen, self.ID)))
+        self.load_state_dict(torch.load(args.loadPath+"model_%d_%d.pth" % (gen, self.ID)))
 
 
 
@@ -249,11 +250,29 @@ class EvolvingSparseConnectedModel(nn.Module):
 # Main
 #####################################################################################
 
+
+parents = [EvolvingSparseConnectedModel(m) for m in range(args.numMember)]
+accuracy = []
+for acc, parent in zip(accuracy, parents):
+    parent.accuracy = acc
+    parent.load(args.startGen-1)
+
+parents.sort(key=lambda x: x.accuracy, reverse=True)
+lottery = []
+for idx, AI in enumerate(parents):
+    for _ in range(int((args.numMember-idx)**(1.5))):
+        lottery.append(AI.ID) 
+logger.log(str(lottery))
+
+
 AIs = [EvolvingSparseConnectedModel(m) for m in range(args.numMember)]
-if args.retrain == True:
-    for AI in AIs:
-        AI.load(args.startGen)
-    
+#### Make children
+for AI in AIs:
+    parent1 = random.choice(lottery)
+    parent2 = random.choice(lottery)
+    AI.evolve(parents[parent1], parents[parent2])
+
+
 for gen in range(args.startGen, args.numGeneration):
     logger.log("\n\n==============================================")
     logger.log("Generation %d start" % (gen))
